@@ -1,0 +1,20 @@
+# 本地配置（含家里真实 IP）
+config.env
+
+# 运行时产物
+__pycache__/
+*.pyc
+.DS_Store
+receiver/build/
+vocr
+qrgen
+qr.png
+status.json
+wall.jpg
+
+# 实拍截图（含真实直播画面与弹幕昵称，不入库）
+result*.png
+danmu-result.png
+wall-result.png
+words-compare.png
+modes/
