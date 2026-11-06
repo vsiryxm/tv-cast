@@ -1,11 +1,15 @@
 #!/opt/homebrew/bin/python3
 # -*- coding: utf-8 -*-
 """
-直播间「文字看板」——把手机 ScreenStream 画面下方的弹幕 OCR 出来，
-重排成 1920x1080 的大字看板，供电视接收端当作单帧 JPEG 直接显示。
+直播间「文字看板」——把手机屏幕上的直播文字（弹幕 / 进入提示 / 群文字直播）
+OCR 出来，重排成 1920x1080 大字看板，供电视接收端当单帧 JPEG 显示。
 
-链路: 手机 8080/stream.jpeg -> PIL 裁切放大 -> macOS Vision 中文 OCR
-      -> 多帧投票/去重/分类/累积 -> 重排渲染 wall.jpg -> 电视接收端
+通用定位（B 方案）：先整屏低倍 OCR 拿到 Vision 的文字块坐标，按密度自动找出
+「聊天文字带」，再只放大那一带精读。抖音直播伴侣 / 抖音观众端 / 微信视频号 /
+微信群文字页 / 横屏全屏都自适应；检测到 App 或布局切换会重新定位并清空累积。
+
+链路: 手机 8080/stream.jpeg -> 全屏定位 -> 裁切放大 -> macOS Vision 中文 OCR
+      -> 投票/去重/分类/累积 -> 渲染 wall.jpg -> 电视接收端
 
 注意：本机 macOS 会静默丢弃 Homebrew Python 的 LAN 入站连接，
       因此对外静态服务用系统 /usr/bin/python3 起，本进程只负责写文件。
@@ -26,6 +30,8 @@ import urllib.request
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 
 from tvconf import PHONE_IP, TV_IP, ADB
+from locate import (parse_blocks, lines_from_blocks, band_from_blocks,
+                    thumb, layout_diff, is_feed, SWITCH_DIFF)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VOCR = os.path.join(HERE, "vocr")
@@ -35,12 +41,15 @@ PHONE = PHONE_IP
 STREAM = "http://%s:8080/stream.jpeg" % PHONE
 PORT = 8897
 OUT_DIR = "/tmp/tvcast_wall"
-TOP = 0.60          # 弹幕区纵向范围（与接收端弹幕看板模式一致）
+TOP = 0.60          # 兜底区间：自动定位失败时仍保证有画面
 BOTTOM = 0.90
 SCALE = 3
 INTERVAL = 0.8      # OCR 采样间隔（秒）
 MAX_ITEMS = 11
 DEDUP_WINDOW = 180  # 秒：同一句弹幕在这个窗口内只收一次
+LOCATE_EVERY = 5    # 每 N 次采样做一次全屏定位，其余帧复用上次文字带
+VOTE_TIMEOUT = 1.6  # 秒：单帧弹幕等不到第二帧时兜底提交，避免快滚动漏收
+PENDING_TTL = 4.0   # 秒：投票槽存活时间
 
 W, H = 1920, 1080
 FONT_PATH = "/System/Library/Fonts/Hiragino Sans GB.ttc"
@@ -53,12 +62,15 @@ ENTER = (255, 190, 92)
 EMOJI = re.compile("[\U0001F000-\U0001FAFF\u25A0-\u27BF\uFE0F\u200D\u2190-\u21FF]")
 BADGE = re.compile(r"^[\s◆◇◎•●▪°*·、,，]{0,3}\d{1,3}[\s:：]*(?=[\u4e00-\u9fa5])")
 BADGE2 = re.compile(r"^[\u4e00-\u9fa5]\d{1,3}\s+(?=[\u4e00-\u9fa5])")
-NOISE = re.compile(r"[A-Z]+")              # emoji 被 OCR 成的乱码串 / 孤立大写
-ENTER_KW = ("来了", "来啦", "来到", "进来了", "进入直播间", "关注了", "加入了", "进来",
-            "为主播点赞", "点赞了", "分享了", "送出了", "加入粉丝团")
-INTERACT_KW = ("点赞", "分享", "送出", "礼物", "粉丝团")
+NOISE = re.compile(r"\b[A-Z]{2,}\b")      # emoji 被 OCR 成的乱码串（不再误删英文昵称）
+# 跨 App 文案：抖音「来了」、视频号「进入直播间」、微信群口语都覆盖
+ENTER_KW = ("来了", "来啦", "来到", "来到了", "进来了", "进来", "进入了",
+            "进入直播间", "进入房间", "走进了", "围观", "关注了", "关注了主播",
+            "加入了", "加入直播间", "加入粉丝团")
+INTERACT_KW = ("点赞", "分享", "送出", "送出了", "礼物", "粉丝团", "打赏", "为主播点赞")
 
-state = {"count": 0, "last_ocr": "", "error": ""}
+state = {"count": 0, "last_ocr": "", "error": "",
+         "band": [TOP, BOTTOM], "layout": "fallback"}
 items = []
 seen = {}
 pending = []   # 连续帧投票：同一条弹幕每帧 OCR 出的错字变体先归到一个槽
@@ -114,18 +126,28 @@ def sim(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+ENTER_VERB = (r"(来了|来啦|来到|来到了|进来了|进来|进入了|进入直播间|进入房间|"
+              r"走进了|围观|关注了主播|关注了|加入了|加入直播间|加入粉丝团)")
+
+
 def split_name(s):
     parts = re.split(r"[：:]", s, maxsplit=1)
     if len(parts) == 2 and parts[0].strip():
         return parts[0].strip(), parts[1].strip()
-    m = re.match(r"^(.{1,12}?)\s+(来了|来啦|来到直播间|进来了|关注了主播|加入了).*$", s)
+    m = re.match(r"^(.{1,14}?)\s*" + ENTER_VERB + r".*$", s)
     if m:
         return m.group(1).strip(), m.group(2)
     return "", s
 
 
 def classify(s, body):
-    if any(k in (s + body) for k in ENTER_KW) and len(s) <= 30:
+    text = s + body
+    # 推荐流里的「点击进入直播间」是入口卡片，不是某人进房提示
+    if any(k in text for k in ("点击进入", "点击", "拍同款", "相关搜索")):
+        return "chat"
+    if len(s) <= 30 and any(k in text for k in INTERACT_KW):
+        return "interact"
+    if len(s) <= 30 and any(k in text for k in ENTER_KW):
         return "enter"
     return "chat"
 
@@ -157,30 +179,43 @@ def add_line(text):
 
 def observe(text):
     """同一条弹幕会在屏幕上停留数秒，逐帧 OCR 会给出略不同的错字。
-    先按相似度聚到一个槽，累计 >=2 帧才入库，并取与其它候选平均最像的写法（medoid），
-    这样既去掉偶发乱码，也保证一条弹幕只出现一次。"""
+    先按相似度聚到一个槽，取 medoid 写法入库；等不到第二帧的快滚动弹幕
+    由 flush_pending() 按超时兜底提交，避免漏收。"""
     t = clean(text)
     n = norm(t)
     if not valid(n):
         return False
     now = time.time()
-    pending[:] = [p for p in pending if now - p["last"] < 10.0]
+    pending[:] = [p for p in pending if now - p["last"] < PENDING_TTL]
     hit = None
     for p in pending:
-        if sim(n, p["n"]) > 0.55:
+        if not p["committed"] and sim(n, p["n"]) > 0.55:
             hit = p
             break
     if hit is None:
-        pending.append({"n": n, "texts": [t], "last": now, "committed": False})
+        pending.append({"n": n, "texts": [t], "first": now,
+                        "last": now, "committed": False})
         return False
     hit["texts"].append(t)
     hit["last"] = now
-    if hit["committed"] or len(hit["texts"]) < 2:
-        return False
     cands = list(dict.fromkeys(hit["texts"]))
     best = max(cands, key=lambda c: sum(sim(norm(c), norm(o)) for o in cands))
     hit["committed"] = True
     return add_line(best)
+
+
+def flush_pending():
+    """只被抓到一帧的弹幕（滚动太快）超时后也提交，配合 add_line 去重。"""
+    now = time.time()
+    added = 0
+    for p in list(pending):
+        if p["committed"]:
+            continue
+        if now - p["first"] >= VOTE_TIMEOUT:
+            p["committed"] = True
+            if add_line(p["texts"][-1]):
+                added += 1
+    return added
 
 
 def parse_ocr(out):
@@ -224,25 +259,35 @@ def render():
     d.rectangle((0, 0, W, 96), fill=(20, 25, 35))
     d.rectangle((0, 94, W, 96), fill=(52, 62, 80))
     d.text((56, 24), "直播间 · 实时文字看板", font=F_TITLE, fill=WHITE)
-    sub = "%s   ·   共 %d 条   ·   AI 识别自动累积" % (time.strftime("%H:%M:%S"), state["count"])
+    band = state.get("band", [TOP, BOTTOM])
+    if state.get("paused"):
+        focus = "当前不是直播间 · 已暂停抓取"
+    elif state.get("layout") == "chat":
+        focus = "整屏文字"
+    else:
+        focus = "自动聚焦 %.2f~%.2f" % (band[0], band[1])
+    sub = "%s   ·   共 %d 条   ·   %s" % (time.strftime("%H:%M:%S"), state["count"], focus)
     d.text((W - 56 - d.textlength(sub, font=F_SUB), 36), sub, font=F_SUB, fill=GRAY)
 
     row_h = 82
     y0 = 118
+    TAG = {"enter": "进入", "interact": "互动", "chat": "发言"}
+    if not items:
+        msg = "等待进入直播间…" if state.get("paused") else "等待屏幕上的文字…"
+        d.text(((W - d.textlength(msg, font=F_NAME)) / 2, 430), msg,
+               font=F_NAME, fill=GRAY)
     for i, it in enumerate(list(items)):
         y = y0 + i * row_h
         if y + row_h > H - 54:
             break
+        kind = it["kind"] if it["kind"] in TAG else "chat"
+        color = CHAT if kind == "chat" else ENTER
         fresh = time.time() - it["ts"] < 4
         if fresh:
             d.rounded_rectangle((40, y + 2, W - 40, y + row_h - 6), radius=10, fill=(30, 38, 52))
-            d.rectangle((40, y + 2, 46, y + row_h - 6), fill=ENTER if it["kind"] == "enter" else CHAT)
-        color = ENTER if it["kind"] == "enter" else CHAT
+            d.rectangle((40, y + 2, 46, y + row_h - 6), fill=color)
         d.text((62, y + 24), it["time"], font=F_TIME, fill=GRAY)
-        if it["kind"] == "enter":
-            tag = "互动" if any(k in it["body"] for k in INTERACT_KW) else "进入"
-        else:
-            tag = "发言"
+        tag = TAG[kind]
         d.rounded_rectangle((222, y + 20, 306, y + 60), radius=8, fill=(38, 46, 60))
         d.text((236, y + 25), tag, font=F_TAG, fill=color)
 
@@ -284,25 +329,87 @@ def publish():
                    "body": i["body"], "kind": i["kind"]} for i in items],
         "count": state["count"], "last_ocr": state["last_ocr"],
         "error": state["error"],
+        "band": state["band"], "layout": state["layout"],
+        "paused": state.get("paused", False),
     }
     atomic_write("status.json", json.dumps(status, ensure_ascii=False).encode("utf-8"))
 
 
 def ocr_loop():
+    """两阶段：整屏低倍 OCR 拿坐标 → 自动聚焦文字带精读；布局切换自动重定位。"""
     tmp = "/tmp/tvcast_ocr_input.png"
+    full_tmp = "/tmp/tvcast_ocr_full.png"
+    band = (TOP, BOTTOM)
+    mode = "fallback"
+    paused = False
+    was_paused = False
+    last_thumb = None
+    switch_hits = 0
+    tick = 0
     while True:
         try:
             raw = urllib.request.urlopen(STREAM, timeout=4).read()
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             w, h = img.size
-            crop = img.crop((0, int(h * TOP), w, int(h * BOTTOM)))
-            crop = crop.resize((crop.width * SCALE, crop.height * SCALE), Image.LANCZOS)
-            crop = ImageEnhance.Contrast(crop).enhance(1.18)
-            crop = ImageEnhance.Sharpness(crop).enhance(1.5)
-            crop.save(tmp)
-            r = subprocess.run([VOCR, tmp], capture_output=True, timeout=20)
-            lines = merge_wrapped(parse_ocr(r.stdout.decode("utf-8", "replace")))
-            added = 0
+
+            # 低频缩略图判 App / 布局切换：连续 2 次大变化才触发，避开特效抖动
+            cur = thumb(img)
+            diff = layout_diff(last_thumb, cur)
+            last_thumb = cur
+            switch_hits = switch_hits + 1 if diff > SWITCH_DIFF else max(0, switch_hits - 1)
+            force = False
+            if switch_hits >= 2:
+                items[:] = []
+                seen.clear()
+                pending[:] = []
+                state["count"] = 0
+                switch_hits = 0
+                force = True
+                print("[wall] 检测到 App / 布局切换，已清空累积并重新定位", flush=True)
+
+            need_locate = force or tick % LOCATE_EVERY == 0 or mode == "fallback"
+            blocks = []
+            if need_locate or mode == "chat":
+                # 整屏只做轻度增强：目的是拿全局文字块坐标，不追求读得多准
+                full = ImageEnhance.Contrast(img).enhance(1.12)
+                full.save(full_tmp)
+                r = subprocess.run([VOCR, full_tmp], capture_output=True, timeout=20)
+                blocks = parse_blocks(r.stdout.decode("utf-8", "replace"))
+            if need_locate:
+                top, bottom, mode = band_from_blocks(blocks, (TOP, BOTTOM))
+                band = (top, bottom)
+                state["band"] = [round(top, 3), round(bottom, 3)]
+                state["layout"] = mode
+                # 刷短视频 / 看推荐流时不要把标题、话题、广告灌进看板
+                # 对 chat 模式同样生效：文字铺满的图文页也不是直播文字
+                paused = is_feed(blocks)
+                state["paused"] = paused
+                print("[wall] 自动定位 %.3f~%.3f (%s, %d 个文字块)%s" %
+                      (top, bottom, mode, len(blocks), " · 非直播页暂停" if paused else ""),
+                      flush=True)
+                if paused != was_paused:
+                    print("[wall] %s" % ("已离开直播间，暂停抓取" if paused
+                                         else "已回到直播/文字页，恢复抓取"), flush=True)
+                    was_paused = paused
+
+            if mode == "chat":
+                # 微信群等纯文字页：全屏 OCR 结果本身就是消息行，不必再裁切
+                lines = merge_wrapped(lines_from_blocks(blocks))
+            else:
+                top, bottom = band
+                if bottom - top < 0.05:
+                    top, bottom = TOP, BOTTOM
+                crop = img.crop((0, int(h * top), w, int(h * bottom)))
+                crop = crop.resize((crop.width * SCALE, crop.height * SCALE), Image.LANCZOS)
+                crop = ImageEnhance.Contrast(crop).enhance(1.18)
+                crop = ImageEnhance.Sharpness(crop).enhance(1.5)
+                crop.save(tmp)
+                r = subprocess.run([VOCR, tmp], capture_output=True, timeout=20)
+                lines = merge_wrapped(parse_ocr(r.stdout.decode("utf-8", "replace")))
+
+            if paused:
+                lines = []
+            added = flush_pending()
             for line in lines:
                 if observe(line):
                     added += 1
@@ -315,6 +422,7 @@ def ocr_loop():
         except Exception as e:
             state["error"] = "%s: %s" % (type(e).__name__, e)
             print("[wall] 采样异常:", type(e).__name__, str(e)[:100], flush=True)
+        tick += 1
         time.sleep(INTERVAL)
 
 
