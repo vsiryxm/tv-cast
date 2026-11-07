@@ -11,6 +11,9 @@ TV_IP=${TV_IP:-192.168.2.98}
 PHONE_IP=${PHONE_IP:-192.168.2.83}
 DEV="${TV_IP}:5555"
 PHONE="${PHONE_IP}"
+# 本机可能被注入 http_proxy（IDE/代理工具），局域网设备与本机静态服务必须直连
+export no_proxy="localhost,127.0.0.1,${TV_IP},${PHONE_IP}${no_proxy:+,$no_proxy}"
+export NO_PROXY="${no_proxy}"
 PKG=com.xinmin.tvcast
 ACT="${PKG}/.ReceiverActivity"
 APK="$(pwd)/receiver/tvcast.apk"

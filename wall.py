@@ -29,7 +29,7 @@ import time
 import urllib.request
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 
-from tvconf import PHONE_IP, TV_IP, ADB
+from tvconf import PHONE_IP, TV_IP, MAC_IP, ADB
 from locate import (parse_blocks, lines_from_blocks, band_from_blocks,
                     thumb, layout_diff, is_feed, SWITCH_DIFF)
 
@@ -39,6 +39,9 @@ VOCR_SRC = os.path.join(HERE, "vocr.swift")
 
 PHONE = PHONE_IP
 STREAM = "http://%s:8080/stream.jpeg" % PHONE
+# 本机常被注入 http_proxy（IDE/代理工具），实测 proxy_bypass('192.168.2.83')=False，
+# 会把局域网流和本机静态服务都劫持到代理上。投屏链路一律强制直连。
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PORT = 8897
 OUT_DIR = "/tmp/tvcast_wall"
 TOP = 0.60          # 兜底区间：自动定位失败时仍保证有画面
@@ -70,24 +73,33 @@ ENTER_KW = ("来了", "来啦", "来到", "来到了", "进来了", "进来", "�
 INTERACT_KW = ("点赞", "分享", "送出", "送出了", "礼物", "粉丝团", "打赏", "为主播点赞")
 
 state = {"count": 0, "last_ocr": "", "error": "",
-         "band": [TOP, BOTTOM], "layout": "fallback"}
+         "band": [TOP, BOTTOM], "layout": "fallback",
+         "offline": True}   # 开机即「准备态」，拿到第一帧才转在线
 items = []
 seen = {}
 pending = []   # 连续帧投票：同一条弹幕每帧 OCR 出的错字变体先归到一个槽
 
 
 def lan_ip():
-    s = socket.socket()
-    try:
-        s.connect((PHONE, 8080))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
+    """取本机 LAN IP。不能用「连手机 8080 成功」来探测：手机还没点 Start 时
+    会退回 127.0.0.1，电视被指向自己的回环地址，必然黑屏。
+    UDP connect 不实际发包，只让内核按路由选出出口网卡，目标不在线也能拿到 IP。"""
+    for target in (PHONE, TV_IP, "192.168.2.1", "8.8.8.8"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.close()
+            s.settimeout(0.5)
+            s.connect((target, 9))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
         except Exception:
             pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return MAC_IP
 
 
 def font(size):
@@ -260,7 +272,9 @@ def render():
     d.rectangle((0, 94, W, 96), fill=(52, 62, 80))
     d.text((56, 24), "直播间 · 实时文字看板", font=F_TITLE, fill=WHITE)
     band = state.get("band", [TOP, BOTTOM])
-    if state.get("paused"):
+    if state.get("offline"):
+        focus = "等待手机推流"
+    elif state.get("paused"):
         focus = "当前不是直播间 · 已暂停抓取"
     elif state.get("layout") == "chat":
         focus = "整屏文字"
@@ -272,11 +286,18 @@ def render():
     row_h = 82
     y0 = 118
     TAG = {"enter": "进入", "interact": "互动", "chat": "发言"}
-    if not items:
+    if state.get("offline"):
+        msg = "准备就绪 · 请在手机上打开 ScreenStream 并点 Start"
+        d.text(((W - d.textlength(msg, font=F_NAME)) / 2, 408), msg,
+               font=F_NAME, fill=WHITE)
+        hint = "手机 %s:8080 一连上，这里会自动变成直播文字看板" % PHONE
+        d.text(((W - d.textlength(hint, font=F_SUB)) / 2, 478), hint,
+               font=F_SUB, fill=GRAY)
+    elif not items:
         msg = "等待进入直播间…" if state.get("paused") else "等待屏幕上的文字…"
         d.text(((W - d.textlength(msg, font=F_NAME)) / 2, 430), msg,
                font=F_NAME, fill=GRAY)
-    for i, it in enumerate(list(items)):
+    for i, it in enumerate([] if state.get("offline") else list(items)):
         y = y0 + i * row_h
         if y + row_h > H - 54:
             break
@@ -331,6 +352,7 @@ def publish():
         "error": state["error"],
         "band": state["band"], "layout": state["layout"],
         "paused": state.get("paused", False),
+        "offline": state.get("offline", False),
     }
     atomic_write("status.json", json.dumps(status, ensure_ascii=False).encode("utf-8"))
 
@@ -348,7 +370,7 @@ def ocr_loop():
     tick = 0
     while True:
         try:
-            raw = urllib.request.urlopen(STREAM, timeout=4).read()
+            raw = DIRECT.open(STREAM, timeout=4).read()
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             w, h = img.size
 
@@ -416,12 +438,19 @@ def ocr_loop():
             state["count"] = len(items)
             state["last_ocr"] = time.strftime("%H:%M:%S")
             state["error"] = ""
+            if state.get("offline"):
+                state["offline"] = False
+                print("[wall] 手机推流已就绪，开始识别", flush=True)
             publish()
             if added:
                 print("[wall] 新增 %d 条：%s" % (added, " | ".join(clean(x) for x in lines)), flush=True)
         except Exception as e:
+            # 手机没点 Start 时也要持续刷新看板画面，否则电视会永远停在上一张旧图
+            state["offline"] = True
             state["error"] = "%s: %s" % (type(e).__name__, e)
-            print("[wall] 采样异常:", type(e).__name__, str(e)[:100], flush=True)
+            if tick % 6 == 0:
+                publish()
+                print("[wall] 等待手机推流 (%s)" % str(e)[:70], flush=True)
         tick += 1
         time.sleep(INTERVAL)
 
