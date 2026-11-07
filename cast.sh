@@ -17,6 +17,9 @@ export NO_PROXY="${no_proxy}"
 PKG=com.xinmin.tvcast
 ACT="${PKG}/.ReceiverActivity"
 APK="$(pwd)/receiver/tvcast.apk"
+KPKG=com.xinmin.karaoke
+KACT="${KPKG}/.KaraokeActivity"
+KAPK="$(pwd)/karaoke/karaoke.apk"
 
 case "${1}" in
   serve)
@@ -101,6 +104,16 @@ print("8080 推流   :", "已就绪，可直接 ./cast.sh apk" if up(8080) else 
     "${ADB}" -s "${DEV}" shell "am force-stop ${PKG}" >/dev/null 2>&1
     exec "${ADB}" -s "${DEV}" shell "am start -n ${ACT} --ei scan 1"
     ;;
+  karaoke)
+    # 离线 K 歌机：U 盘插电视，装好 APK 并切过去；之后本机可关机
+    "${ADB}" connect "${DEV}" >/dev/null 2>&1
+    "${ADB}" -s "${DEV}" install -r "${KAPK}" 2>&1 | tail -1
+    "${ADB}" -s "${DEV}" shell "am force-stop ${PKG}" >/dev/null 2>&1
+    exec "${ADB}" -s "${DEV}" shell "am start -n ${KACT}"
+    ;;
+  karaoke-build)
+    bash karaoke/build.sh && exec "${ADB}" -s "${DEV}" install -r "${KAPK}"
+    ;;
   build)
     bash receiver/build.sh && exec "${ADB}" -s "${DEV}" install -r "${APK}"
     ;;
@@ -131,6 +144,11 @@ print("8080 推流   :", "已就绪，可直接 ./cast.sh apk" if up(8080) else 
     echo "  ./cast.sh danmu [上 下]      只看直播下方文字（大字全屏，免本机）；上下键微调"
     echo "  ./cast.sh apkstop            退出接收端，回到电视桌面"
     echo "  ./cast.sh build              重新编译并安装接收端 APK"
+    echo ""
+    echo "【离线 K 歌机】U 盘插电视，本机可关机"
+    echo "  ./cast.sh karaoke            装好/切到 K 歌机（U 盘放 MP3 + 同名 LRC）"
+    echo "  ./cast.sh karaoke-build      改了 Java 后重新编译安装"
+    echo "  ./cast.sh apk               切回直播投屏/文字看板"
     echo ""
     echo "【AI 增强】只看文字，字号更大、消息自动累积（本机需常开）"
     echo "  ./cast.sh wall               OCR 弹幕 → 超大字看板（本机需常开，Ctrl+C 自动切回）"

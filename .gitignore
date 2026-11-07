@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 .DS_Store
 receiver/build/
+karaoke/build/
 vocr
 qrgen
 qr.png
