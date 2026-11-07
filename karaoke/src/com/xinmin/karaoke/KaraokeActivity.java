@@ -44,6 +44,7 @@ import java.io.FileReader;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -61,6 +62,13 @@ public class KaraokeActivity extends Activity {
     private static final Pattern LRC_OFFSET =
         Pattern.compile("\\[offset:\\s*([+-]?\\d+)\\s*\\]", Pattern.CASE_INSENSITIVE);
 
+    /* 伴奏版命名约定：主歌「歌名.mp3」+「歌名.伴奏.mp3」放在同一目录。
+       伴奏文件不单独占歌单位置，只作为同一首歌的可切换音源。 */
+    private static final String[] INST_SUFFIXES = {
+        ".伴奏", "-伴奏", "_伴奏", "(伴奏)", " (伴奏)",
+        ".inst", "-inst", "_inst", " (inst)"
+    };
+
     static class Line {
         long ms;
         String text;
@@ -70,6 +78,7 @@ public class KaraokeActivity extends Activity {
     static class Song {
         String name;
         String path;
+        String instPath;      // 伴奏版音源；null 表示这首歌只有原唱
         boolean hasLrc;
         ArrayList<Line> lines = new ArrayList<Line>();
     }
@@ -79,6 +88,9 @@ public class KaraokeActivity extends Activity {
     private int listCursor = 0;
     private boolean showList = false;
     private boolean playing = false;
+    private boolean useInst = false;   // 全局音轨模式，换歌后保持
+    private int seekFloor = 0;         // 切音轨后 seek 生效前，歌词时钟的短暂兜底
+    private long seekFloorUntil = 0;
     private boolean backArmed = false;
     private String err = "";
     private String rootHint = "";
@@ -256,6 +268,46 @@ public class KaraokeActivity extends Activity {
         }
     }
 
+    /* ---------------- 双音轨（原唱 / 伴奏） ---------------- */
+
+    private boolean isAudio(String n) {
+        String s = n.toLowerCase();
+        return s.endsWith(".mp3") || s.endsWith(".wav")
+            || s.endsWith(".m4a") || s.endsWith(".ogg");
+    }
+
+    private String stemOfName(String n) {
+        int d = n.lastIndexOf('.');
+        return d > 0 ? n.substring(0, d) : n;
+    }
+
+    private String keyOf(File f) {
+        File d = f.getParentFile();
+        return (d == null ? "" : d.getAbsolutePath()) + "/" + stemOfName(f.getName());
+    }
+
+    /* 伴奏版文件 -> 主歌 key；必须同目录真有主音频，否则当作独立歌曲，不会丢歌。 */
+    private String ownerKey(File f) {
+        String stem = stemOfName(f.getName());
+        for (String suf : INST_SUFFIXES) {
+            if (!stem.endsWith(suf)) continue;
+            String base = stem.substring(0, stem.length() - suf.length());
+            if (base.length() == 0) continue;
+            File dir = f.getParentFile();
+            File[] fs = dir == null ? null : dir.listFiles();
+            if (fs == null) continue;
+            for (File g : fs) {
+                if (g.equals(f) || !isAudio(g.getName())) continue;
+                if (stemOfName(g.getName()).equals(base)) return keyOf(g);
+            }
+        }
+        return null;
+    }
+
+    private String audioPath(Song s) {
+        return (useInst && s.instPath != null) ? s.instPath : s.path;
+    }
+
     private void rescan() {
         HashSet<String> seen = new HashSet<String>();
         ArrayList<File> roots = new ArrayList<File>();
@@ -273,14 +325,29 @@ public class KaraokeActivity extends Activity {
             }
         });
 
+        // 伴奏版只挂到对应主歌上，不单独占一个歌单位置
+        HashMap<String, String> instMap = new HashMap<String, String>();
+        ArrayList<File> mains = new ArrayList<File>();
+        for (File f : files) {
+            String owner = ownerKey(f);
+            if (owner != null) {
+                if (!instMap.containsKey(owner)) instMap.put(owner, f.getAbsolutePath());
+            } else {
+                mains.add(f);
+            }
+        }
+
         ArrayList<Song> fresh = new ArrayList<Song>();
         String foundDir = "";
-        for (File f : files) {
+        int withInst = 0;
+        for (File f : mains) {
             if (foundDir.length() == 0 && f.getParentFile() != null)
                 foundDir = f.getParentFile().getAbsolutePath();
             Song s = new Song();
             s.path = f.getAbsolutePath();
-            s.name = f.getName().replaceFirst("\\.[^.]+$", "");
+            s.name = stemOfName(f.getName());
+            s.instPath = instMap.get(keyOf(f));
+            if (s.instPath != null) withInst++;
             File lrc = findLrc(f);
             if (lrc != null) {
                 s.lines = loadLrc(lrc);
@@ -293,7 +360,7 @@ public class KaraokeActivity extends Activity {
         if (listCursor >= songs.size()) listCursor = 0;
         rootHint = foundDir.length() > 0 ? ("曲库: " + foundDir)
                  : ("已扫描 " + roots.size() + " 个位置，未找到歌曲");
-        Log.i(TAG, "扫描到 " + songs.size() + " 首歌；" + rootHint);
+        Log.i(TAG, "扫描到 " + songs.size() + " 首歌（" + withInst + " 首有伴奏版）；" + rootHint);
         for (File d : roots) {
             Log.i(TAG, "  扫描根 " + d.getAbsolutePath()
                 + " -> " + (d.listFiles() == null ? "不可读" : "可读"));
@@ -389,9 +456,13 @@ public class KaraokeActivity extends Activity {
         playing = false;
     }
 
-    private void play(final int idx) {
+    private void play(final int idx) { play(idx, 0, true); }
+
+    /* startAt > 0 用于切换音轨时保住播放位置；autoStart 决定是否立即播放。 */
+    private void play(final int idx, int startAt, boolean autoStart) {
         if (songs.isEmpty()) return;
         stopPlayer();
+        seekFloor = 0;
         cur = ((idx % songs.size()) + songs.size()) % songs.size();
         listCursor = cur;
         final Song s = songs.get(cur);
@@ -399,7 +470,7 @@ public class KaraokeActivity extends Activity {
         try {
             player = new MediaPlayer();
             player.setAudioStreamType(AudioManager.STREAM_MUSIC);
-            player.setDataSource(s.path);
+            player.setDataSource(audioPath(s));
             player.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
                 public void onCompletion(MediaPlayer mp) { play(cur + 1); }
             });
@@ -412,8 +483,31 @@ public class KaraokeActivity extends Activity {
                 }
             });
             player.prepare();
-            player.start();
-            playing = true;
+            int target = startAt;
+            if (target > 0) {
+                int dur = player.getDuration();
+                if (dur > 0 && target > dur - 500) target = Math.max(0, dur - 500);
+            }
+            if (autoStart) { player.start(); playing = true; }
+            else if (target > 0) { player.start(); player.pause(); }
+            if (target > 0) {
+                /* 这台 4.0.4 的 MediaPlayer 在 PREPARED 状态立刻 seekTo 会被静默忽略，
+                   必须先进入 STARTED，再 seek 一次，并延迟补一次兜底。 */
+                final MediaPlayer mp = player;
+                final int to = target;
+                seekFloor = to;
+                seekFloorUntil = System.currentTimeMillis() + 800;
+                mp.seekTo(to);
+                handler.postDelayed(new Runnable() {
+                    public void run() {
+                        try {
+                            if (mp != player) return;
+                            mp.seekTo(to);
+                            Log.i(TAG, "切音轨补 seek -> " + mp.getCurrentPosition() + "ms");
+                        } catch (Exception e) { }
+                    }
+                }, 350);
+            }
         } catch (Exception e) {
             err = "无法播放：" + e.getClass().getSimpleName();
             Log.e(TAG, err, e);
@@ -428,6 +522,26 @@ public class KaraokeActivity extends Activity {
         if (playing) { player.pause(); playing = false; }
         else { player.start(); playing = true; }
         view.invalidate();
+    }
+
+    /* 一键切原唱/伴奏：换音源但保住播放位置和歌词时钟（歌词由播放位置驱动）。 */
+    private void switchTrack() {
+        if (songs.isEmpty()) return;
+        Song s = songs.get(cur);
+        if (s.instPath == null) {
+            Toast.makeText(this, "这首歌没有伴奏版：请在同目录放「" + s.name + ".伴奏.mp3」",
+                           Toast.LENGTH_LONG).show();
+            Log.i(TAG, "无伴奏版: " + s.name);
+            return;
+        }
+        int pos = position();
+        boolean wasPlaying = playing;
+        useInst = !useInst;
+        play(cur, pos, wasPlaying);
+        String msg = useInst ? "已切换到伴奏版" : "已切换到原唱版";
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+        Log.i(TAG, msg + "；保持位置 " + pos + "ms；音源 " + audioPath(s));
+        if (view != null) view.invalidate();
     }
 
     private void seek(int delta) {
@@ -454,8 +568,11 @@ public class KaraokeActivity extends Activity {
     }
 
     private int position() {
-        try { return player == null ? 0 : player.getCurrentPosition(); }
-        catch (Exception e) { return 0; }
+        try {
+            int p = player == null ? 0 : player.getCurrentPosition();
+            if (p < seekFloor && System.currentTimeMillis() < seekFloorUntil) return seekFloor;
+            return p;
+        } catch (Exception e) { return 0; }
     }
 
     private int duration() {
@@ -490,6 +607,11 @@ public class KaraokeActivity extends Activity {
                 play(cur + 1); return true;
             case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
                 play(cur - 1); return true;
+            case KeyEvent.KEYCODE_0:
+            case KeyEvent.KEYCODE_M:
+            case KeyEvent.KEYCODE_MUTE:
+            case KeyEvent.KEYCODE_VOLUME_MUTE:
+                switchTrack(); return true;
             case KeyEvent.KEYCODE_MENU:
                 if (showList) { showList = false; rescan(); Toast.makeText(this, "已重新扫描 U 盘", Toast.LENGTH_SHORT).show(); }
                 else { showList = true; listCursor = cur; }
@@ -574,6 +696,12 @@ public class KaraokeActivity extends Activity {
                 + "     " + mmss(position()) + " / " + (duration() > 0 ? mmss(duration()) : "--:--")
                 + "     " + rootHint;
             c.drawText(meta, pad, H * 0.155f, pSub);
+            String track = songs.isEmpty() ? ""
+                : (songs.get(cur).instPath == null ? "仅原唱"
+                   : (useInst ? "♪ 伴奏版   0 切原唱" : "♪ 原唱版   0 切伴奏"));
+            if (track.length() > 0)
+                c.drawText(track, W - pad - pSub.measureText(track), H * 0.105f, pSub);
+
             String flags = (playing ? "▶ 播放中" : "‖ 已暂停")
                 + (songs.isEmpty() || !songs.get(cur).hasLrc ? "   ·   无歌词文件" : "");
             c.drawText(flags, W - pad - pSub.measureText(flags), H * 0.155f, pSub);
@@ -595,7 +723,7 @@ public class KaraokeActivity extends Activity {
             if (err.length() > 0) {
                 c.drawText(err, W / 2, H * 0.915f, pHint);
             } else {
-                c.drawText("↑↓ 换歌    OK 播放/暂停    ←→ ±5秒    MENU 歌单（再按重扫 U 盘）    BACK 退出",
+                c.drawText("↑↓ 换歌    OK 播放/暂停    ←→ ±5秒    0 原唱/伴奏    MENU 歌单/重扫    BACK 退出",
                            W / 2, H * 0.945f, pHint);
             }
 
@@ -671,8 +799,10 @@ public class KaraokeActivity extends Activity {
                 } else {
                     pCur.setColor(0xFFD8E0F0);
                 }
-                String label = (idx + 1) + ".  " + songs.get(idx).name
-                             + (songs.get(idx).hasLrc ? "" : "   (无词)");
+                Song row = songs.get(idx);
+                String label = (idx + 1) + ".  " + row.name
+                             + (row.instPath != null ? "   [有伴奏]" : "")
+                             + (row.hasLrc ? "" : "   (无词)");
                 pCur.setTextAlign(Paint.Align.CENTER);
                 fit(pCur, label, W * 0.62f, W * 0.023f);
                 c.drawText(label, W / 2, y, pCur);
