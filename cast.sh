@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 # tv-cast 一键入口（终端运行）
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "${HERE}" || exit 1
@@ -104,6 +106,10 @@ print("8080 推流   :", "已就绪，可直接 ./cast.sh apk" if up(8080) else 
     "${ADB}" -s "${DEV}" shell "am force-stop ${PKG}" >/dev/null 2>&1
     exec "${ADB}" -s "${DEV}" shell "am start -n ${ACT} --ei scan 1"
     ;;
+  song)
+    # 给 MP3 + 同名 LRC 一键分离成人声/伴奏双轨；--tv 直接推到电视 U 盘
+    exec bash karaoke/prepare_song.sh "${@:2}"
+    ;;
   karaoke)
     # 离线 K 歌机：U 盘插电视，装好 APK 并切过去；之后本机可关机
     "${ADB}" connect "${DEV}" >/dev/null 2>&1
@@ -146,7 +152,10 @@ print("8080 推流   :", "已就绪，可直接 ./cast.sh apk" if up(8080) else 
     echo "  ./cast.sh build              重新编译并安装接收端 APK"
     echo ""
     echo "【离线 K 歌机】U 盘插电视，本机可关机"
-    echo "  ./cast.sh karaoke            装好/切到 K 歌机（U 盘放 MP3 + 同名 LRC）"
+    echo "  ./cast.sh song '朋友.mp3'     MP3+LRC 一键分离人声/伴奏双轨（可分别调音量）"
+    echo "  ./cast.sh song --tv '朋友.mp3'  同上，并直接推到电视 U 盘"
+    echo "  ./cast.sh song --dir U盘目录   整库批量分离"
+    echo "  ./cast.sh karaoke            装好/切到 K 歌机（1 原唱/伴奏，2 重唱，3 歌单，0 切歌）"
     echo "  ./cast.sh karaoke-build      改了 Java 后重新编译安装"
     echo "  ./cast.sh apk               切回直播投屏/文字看板"
     echo ""
