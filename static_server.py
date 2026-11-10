@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 """用系统 Python 托管看板图片。
 
 为什么单独一个文件：本机 macOS 会静默丢弃 Homebrew Python 的 LAN 入站连接，

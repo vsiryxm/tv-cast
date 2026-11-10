@@ -38,5 +38,8 @@ SOFTWARE.
 
 ---
 
-本仓库自身代码（receiver/、cast.sh、cast.py、serve.py、wall.py、static_server.py、
-vocr.swift、tvconf.py）适用仓库根目录 `LICENSE`（MIT, Copyright (c) 2026 Simon Yang）。
+本仓库自身代码（receiver/、karaoke/src/、cast.sh、cast.py、serve.py、wall.py、
+static_server.py、vocr.swift、tvconf.py 等）适用仓库根目录 `LICENSE`
+（Apache License 2.0, Copyright 2026 Simon Yang）。
+分发时需同时保留 `LICENSE` 与 `NOTICE`；各源文件头部已带
+`SPDX-License-Identifier: Apache-2.0` 标注。

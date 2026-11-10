@@ -1,3 +1,5 @@
+// Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+// SPDX-License-Identifier: Apache-2.0
 package com.xinmin.tvcast;
 
 import android.app.Activity;

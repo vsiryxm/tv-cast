@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 """通用屏幕文字定位：只用 Vision OCR 已返回的归一化坐标找「聊天文字带」。
 
 不绑任何 App：抖音直播伴侣、抖音观众端、微信视频号、微信群文字直播、横屏全屏

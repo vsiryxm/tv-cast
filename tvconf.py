@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 """统一配置：读取同目录 config.env，环境变量优先，没配置则用内置默认值。
 
 改一个 config.env 就能让 cast.sh / cast.py / serve.py / wall.py 用同一组 IP。

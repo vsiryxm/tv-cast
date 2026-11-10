@@ -1,3 +1,5 @@
+// Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+// SPDX-License-Identifier: Apache-2.0
 // 用 macOS 自带 CoreImage 生成二维码 PNG，零第三方依赖。
 // 用法: qrgen <文本> <输出.png>
 import Foundation

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 """tv-cast: 零硬件把小米手机屏幕投到海信 LED50EC280JD。
 
 主通道(已实测可用): 画面源 -> ffmpeg 逐帧 JPEG -> HTTP 单帧接口 -> 电视浏览器 JS 轮询

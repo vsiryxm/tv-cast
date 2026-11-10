@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 """tv-cast 一键装机台：托管 ScreenStream APK + 二维码，并自动接管电视最后一公里。
 
 运行: python3 serve.py

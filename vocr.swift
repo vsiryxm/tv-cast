@@ -1,3 +1,5 @@
+// Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+// SPDX-License-Identifier: Apache-2.0
 import Foundation
 import Vision
 import AppKit

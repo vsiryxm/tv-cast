@@ -1,5 +1,7 @@
 #!/opt/homebrew/bin/python3
 # -*- coding: utf-8 -*-
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 """
 直播间「文字看板」——把手机屏幕上的直播文字（弹幕 / 进入提示 / 群文字直播）
 OCR 出来，重排成 1920x1080 大字看板，供电视接收端当单帧 JPEG 显示。

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright 2026 Simon Yang <https://github.com/vsiryxm/tv-cast>
+# SPDX-License-Identifier: Apache-2.0
 # 为 Android 4.0.4 / API 15 构建极简投屏接收端 APK。
 # 工具链全部位于 /opt/homebrew 中立位置，不依赖 Android Studio / Gradle / Rosetta。
 set -e
@@ -25,8 +27,12 @@ echo "[2/6] 生成 classes.dex"
     "${HERE}/build/classes"
 
 echo "[3/6] 打包二进制 Manifest"
+# Apache-2.0 要求二进制分发附带 NOTICE，打进 assets/ 随包分发。
+mkdir -p "${HERE}/build/assets"
+cp "${HERE}/../NOTICE" "${HERE}/build/assets/NOTICE"
 "${AAPT2}" link -o "${HERE}/build/base.apk" -I "${PLAT}" \
     --manifest "${HERE}/AndroidManifest.xml" \
+    -A "${HERE}/build/assets" \
     --min-sdk-version 15 --target-sdk-version 15 \
     --no-compile-sdk-metadata
 
