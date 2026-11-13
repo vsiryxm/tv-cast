@@ -3,6 +3,8 @@ config.env
 
 # 本机 K 歌台台名配置（因人而异；模板见 karaoke.conf.example）
 karaoke/karaoke.conf
+# 本机台词底稿（歌单因人而异；格式见 karaoke_openings.example.txt，成品放 U 盘根目录）
+karaoke/karaoke_openings.txt
 # build.sh 由上面那份配置生成的资源
 karaoke/res/values/strings.xml
 

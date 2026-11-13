@@ -5,7 +5,7 @@
 # 与 receiver 共用同一把 debug 签名，保证 adb install -r 不会签名冲突。
 # 曲库只有「歌名.mp3 / 歌名.lrc / 歌名.伴奏.mp3」，单实例 MediaPlayer 在
 # 原唱与伴奏两个文件间切换。
-# 台名由同目录 karaoke.conf 的 APP_NAME 决定，未配置就用「K歌台」。
+# 台名、直播提醒时间由同目录 karaoke.conf 决定（直播时间未配置就不提醒）。
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -17,39 +17,54 @@ APKSIGNER="${BT}/lib/apksigner.jar"
 OUT="${HERE}/karaoke.apk"
 KS="${HERE}/../receiver/debug.keystore"
 
-echo "[1/6] 读取 karaoke.conf，生成 res/values/strings.xml"
+echo "[1/6] 读取 karaoke.conf，生成 res/values/strings.xml 与 assets/karaoke.conf"
 # 台名只有一个来源：karaoke.conf 的 APP_NAME（键名大小写不敏感）。
 # 写进 strings.xml 后，Manifest 的 @string/app_name 与 App 内的 config 提示都用它；
 # App 运行时还能被 U 盘根目录的 karaoke.conf（app_name=）再覆盖一次。
+# 白名单里的键另存一份到 assets/karaoke.conf，作为 APK 内的默认值，
+# 这样换台名、改台词停留秒数只改本地 conf，不用碰代码。
+# 开场台词不在配置里：有没有台词只看 U 盘上有没有 karaoke_openings.txt。
 rm -rf "${HERE}/build"
-mkdir -p "${HERE}/build/classes" "${HERE}/res/values"
-/usr/bin/python3 - "${HERE}/karaoke.conf" "${HERE}/res/values/strings.xml" <<'PY'
+mkdir -p "${HERE}/build/classes" "${HERE}/build/assets" "${HERE}/res/values"
+/usr/bin/python3 - "${HERE}/karaoke.conf" "${HERE}/res/values/strings.xml" \
+                  "${HERE}/build/assets/karaoke.conf" <<'PY'
 import sys, os
 from xml.sax.saxutils import escape
 
-conf, out = sys.argv[1], sys.argv[2]
-name = ""
+conf, strings_out, assets_out = sys.argv[1], sys.argv[2], sys.argv[3]
+WHITELIST = ("app_name", "welcome", "opening_secs", "live_start", "live_end")
+
+kv = {}
 if os.path.isfile(conf):
     for line in open(conf, encoding='utf-8-sig'):
         line = line.strip()
         if not line or line.startswith('#') or '=' not in line:
             continue
         key, val = line.split('=', 1)
-        if key.strip().lower() in ('app_name', 'appname'):
-            val = val.strip().strip('"').strip("'").strip()
-            if val:
-                name = val
-                break
-if not name:
-    name = "K歌台"                     # 未配置时的默认台名
+        key = key.strip().lower().replace('appname', 'app_name')
+        val = val.strip().strip('"').strip("'").strip()
+        if key in WHITELIST and val:
+            kv[key] = val
 
-open(out, 'w', encoding='utf-8').write(
+name = kv.get('app_name') or "K歌台"      # 未配置时的默认台名
+
+open(strings_out, 'w', encoding='utf-8').write(
     '<?xml version="1.0" encoding="utf-8"?>\n'
     '<!-- 由 build.sh 依据 karaoke.conf 的 APP_NAME 生成，勿手改 -->\n'
     '<resources>\n'
     '    <string name="app_name">%s</string>\n'
     '</resources>\n' % escape(name, {'"': '&quot;'}))
-print("   台名 = %s" % name)
+
+os.makedirs(os.path.dirname(assets_out), exist_ok=True)
+with open(assets_out, 'w', encoding='utf-8') as f:
+    f.write('# 由 build.sh 从 karaoke/karaoke.conf 生成（只收白名单键）；'
+            'U 盘根目录的同名文件可覆盖这里的值\n')
+    for k in WHITELIST:
+        if k in kv:
+            f.write('%s=%s\n' % (k, kv[k]))
+
+print("   台名 = %s，台词最多 %s 秒（有没有台词看 U 盘台词文件）" % (
+    name, kv.get('opening_secs', '30')))
 PY
 
 echo "[2/6] 编译 Java"

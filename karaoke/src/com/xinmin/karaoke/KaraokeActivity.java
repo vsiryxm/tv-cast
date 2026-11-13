@@ -63,8 +63,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -125,16 +127,43 @@ public class KaraokeActivity extends Activity {
 
     private static final int NOTES = 5;             // 前奏音符个数
     private static final int NOTE_OFF = 0xFF44527A; // 未走到的音符
-    /* ---------- 可配置项：U 盘根目录 karaoke.conf ----------
-       一行一个 key=value，井号开头是注释，键名大小写不敏感。支持两个键：
-         app_name  台名（启动页、顶栏、开机欢迎语都用它）
-         welcome   跑马灯欢迎语，不写就用「欢迎来到 <台名>，」
+    /* ---------- 可配置项：karaoke.conf（APK 内 assets 作默认，U 盘根目录再覆盖） ----------
+       一行一个 key=value，井号开头是注释，键名大小写不敏感，值里用 \n 表示换行。支持的键：
+         app_name       台名（启动页、顶栏、开机欢迎语都用它）
+         welcome        跑马灯欢迎语，不写就用「欢迎来到 <台名>，」
+         opening_secs   台词最多停留秒数，默认 30
+         opening_hold   1 = 开唱后也不提前收，一直停到秒数用完，默认 0
+         live_start    直播开始时间，严格 HH:mm（24 小时制，如 18:30）
+         live_end      直播结束时间，严格 HH:mm；结束须晚于开始
+       两个时间都写对才启用提醒：开始弹一次、结束前 10 分钟预告一次，
+       都常驻到「换一首歌」才收起。缺一个、写错格式、区间倒置 → 整个功能关闭。
        改完重插 U 盘或重启 App 生效；文件不存在、写错、读失败只回落默认，不影响唱歌。
-       台名的构建期默认值由 build.sh 从 karaoke.conf 的 APP_NAME 写进 Manifest，
-       运行时这份配置再覆盖一次，是为了不重新编译也能改名。 */
+       构建期默认值由 build.sh 从 karaoke/karaoke.conf 白名单写进 APK 的 assets/karaoke.conf，
+       所以换台名、改台词秒数不用改代码。 */
     private static final String APP_NAME_FALLBACK = "K歌台";
     private String appName = APP_NAME_FALLBACK;
     private String welcomeText = "";
+
+    /* 开场台词：按歌名（不带扩展名的文件名）从 U 盘台词文件里取，白色半透明卡片浮在
+       歌词左侧。没有开关——台词文件在就有，不在就一句都不显示；播起来以后按遥控器
+       # 键可以临时藏起来，再按一次恢复，只影响本次运行、不落盘。 */
+    private static final String OPENINGS_FILE = "karaoke_openings.txt";
+    private HashMap<String, String> openings = new HashMap<String, String>();
+    private boolean openingOn = true;
+    private boolean openingHold = false;   // 1 = 不因开唱提前收，一直显示到秒数用完
+    private int openingSecs = 30;
+
+    /* 直播提醒：右侧中部常驻卡片，只有换一首歌才收起（重唱 / 切音轨 / seek 都不算）。
+       靠 tick 每分钟检查一次本地时间；同一天同一类提醒只弹一次，记在 prefs 里。 */
+    private boolean liveEnabled = false;
+    private int liveStartMin = -1, liveEndMin = -1;
+    private String liveStartTxt = "", liveEndTxt = "";
+    private int liveNotice = 0;          // 0 无 / 1 开始 / 2 结束预告
+    private int liveNoticeLeft = 10;     // 预告时距离结束还剩几分钟
+    private long lastLiveMinute = -1;
+    /* 折行避头尾：这些标点不放行首 / 不放行尾。 */
+    private static final String NO_LINE_START = "，。、；：！？）》」』”’…·%";
+    private static final String NO_LINE_END   = "（《「『“‘";
     private static final int MARQUEE_MS = 50;       // 顶部跑马灯 20fps，匀速横移
     private static final int INTRO_FADE_MS = 450;   // 开唱后前奏音符淡出上浮的时长
     private static final long ROLL_MS = 450;        // 歌词上滚一格时长
@@ -164,14 +193,23 @@ public class KaraokeActivity extends Activity {
         ArrayList<Line> lines = new ArrayList<Line>();
     }
 
-    /** 双排序：点歌次数降序；次数相同按文件名升序（忽略大小写，再比原值保稳定）。 */
+    /** 排序：今晚歌单里列过的按列的先后排最前；其余点歌次数降序、再按文件名升序。 */
     private final Comparator<Song> SONG_ORDER = new Comparator<Song>() {
         public int compare(Song a, Song b) {
+            int ra = setlistRankOf(a), rb = setlistRankOf(b);
+            if (ra != rb) return ra < rb ? -1 : 1;
             if (a.plays != b.plays) return a.plays > b.plays ? -1 : 1;
             int r = a.name.compareToIgnoreCase(b.name);
             return r != 0 ? r : a.name.compareTo(b.name);
         }
     };
+
+    /* ---------- 今晚歌单：U 盘根目录 karaoke_setlist.txt ----------
+       一行一首，顺序就是演唱顺序，列进去的歌排在歌单最前面，其余照旧按次数排。
+       文件不存在就按老规矩排，什么都不变。 */
+    private static final String SETLIST_FILE = "karaoke_setlist.txt";
+    private HashMap<String, Integer> setlist = new HashMap<String, Integer>();
+    private int setlistHits = 0;      // 今晚歌单里真正在曲库中匹配到的首数
 
     private ArrayList<Song> songs = new ArrayList<Song>();
     private int cur = 0;
@@ -268,9 +306,25 @@ public class KaraokeActivity extends Activity {
     private final Paint pBreath = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pFocusBg = new Paint(Paint.ANTI_ALIAS_FLAG);  // 焦点过渡专用，别污染 pCardOn
     private final Paint pGlow = new Paint(Paint.ANTI_ALIAS_FLAG);     // 进度条末端发光亮点专用
+    private final Paint pOpenBg = new Paint(Paint.ANTI_ALIAS_FLAG);   // 开场台词卡片底
+    private final Paint pOpenTitle = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pOpenText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pLiveBg = new Paint(Paint.ANTI_ALIAS_FLAG);    // 直播提醒卡片底
+    private final Paint pLiveEdge = new Paint(Paint.ANTI_ALIAS_FLAG);  // 呼吸金边
+    private final Paint pLiveTag = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pLiveMain = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pLiveSub = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pLiveFoot = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /* 台词折行结果按「正文 + 可用宽度 + 字号」缓存：这段文字每帧都要画，
+       不缓存就要逐字 measureText，老电视上白烧 CPU。 */
+    private ArrayList<String> openRows = null;
+    private String openRowsFor = "";
+    private float openRowsW = -1f;
+    private float openRowsFs = -1f;
 
     private final Runnable tick = new Runnable() {
         public void run() {
+            checkLiveNotice();
             if (view != null) view.invalidate();
             // 换句前后 40fps；平时 20fps 供顶部跑马灯匀速横移（其余画面不常重绘）
             boolean rolling = rollStartAt > 0
@@ -389,6 +443,21 @@ public class KaraokeActivity extends Activity {
         pIco.setColor(INK);
         pNum.setTextAlign(Paint.Align.CENTER);
         pNum.setTypeface(Typeface.DEFAULT_BOLD);
+
+        pLiveBg.setColor(0xF21B2740);
+        pLiveEdge.setStyle(Paint.Style.STROKE);
+        pLiveEdge.setStrokeWidth(5f);
+        pLiveEdge.setColor(GOLD);
+        pLiveTag.setColor(GOLD);
+        pLiveTag.setTextAlign(Paint.Align.LEFT);
+        pLiveTag.setTypeface(Typeface.DEFAULT_BOLD);
+        pLiveMain.setColor(Color.WHITE);
+        pLiveMain.setTextAlign(Paint.Align.LEFT);
+        pLiveMain.setTypeface(Typeface.DEFAULT_BOLD);
+        pLiveSub.setColor(INK_SOFT);
+        pLiveSub.setTextAlign(Paint.Align.LEFT);
+        pLiveFoot.setColor(INK_DIM);
+        pLiveFoot.setTextAlign(Paint.Align.LEFT);
     }
 
     /* ---------------- 记忆 ---------------- */
@@ -565,10 +634,41 @@ public class KaraokeActivity extends Activity {
         }
     }
 
-    /** 读 U 盘根目录的 karaoke.conf，返回全部键值（键名已转小写）。
-        只在第一个找到的配置文件里读，读不到返回空表。 */
+    /** 解析一份 conf（一行一个 key=value），写进 kv；后读的覆盖先读的。 */
+    private void parseConf(BufferedReader br, HashMap<String, String> kv) throws IOException {
+        String line;
+        while ((line = br.readLine()) != null) {
+            if (line.length() > 0 && line.charAt(0) == '\uFEFF')
+                line = line.substring(1);          // 记事本 UTF-8 BOM
+            line = line.trim();
+            if (line.length() == 0 || line.startsWith("#")) continue;
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String k = line.substring(0, eq).trim().toLowerCase();
+            String v = line.substring(eq + 1).trim();
+            if (v.length() > 1 && v.charAt(0) == '"' && v.charAt(v.length() - 1) == '"')
+                v = v.substring(1, v.length() - 1).trim();   // 容忍手滑加的引号
+            if (k.length() > 0 && v.length() > 0) kv.put(k, v.replace("\\n", "\n"));
+        }
+    }
+
+    /** 读 APK 内 assets/karaoke.conf（build.sh 生成的构建期默认值）。没有就跳过。 */
+    private void readConfAsset(HashMap<String, String> kv) {
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new InputStreamReader(
+                getAssets().open("karaoke.conf"), "UTF-8"), 512);
+            parseConf(br, kv);
+        } catch (Exception ignored) {
+        } finally {
+            try { if (br != null) br.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    /** 配置 = assets 默认值 + U 盘根目录 karaoke.conf 覆盖（只在第一个找到的文件里读）。 */
     private HashMap<String, String> readConf() {
         HashMap<String, String> kv = new HashMap<String, String>();
+        readConfAsset(kv);
         for (String r : ROOTS) {
             File f = new File(r, "karaoke.conf");
             if (!f.isFile()) continue;
@@ -576,37 +676,231 @@ public class KaraokeActivity extends Activity {
             try {
                 br = new BufferedReader(
                     new InputStreamReader(new FileInputStream(f), "UTF-8"), 512);
-                String line;
-                while ((line = br.readLine()) != null) {
-                    if (line.length() > 0 && line.charAt(0) == '\uFEFF')
-                        line = line.substring(1);          // 记事本 UTF-8 BOM
-                    line = line.trim();
-                    if (line.length() == 0 || line.startsWith("#")) continue;
-                    int eq = line.indexOf('=');
-                    if (eq <= 0) continue;
-                    String k = line.substring(0, eq).trim().toLowerCase();
-                    String v = line.substring(eq + 1).trim();
-                    if (v.length() > 1 && v.charAt(0) == '"' && v.charAt(v.length() - 1) == '"')
-                        v = v.substring(1, v.length() - 1).trim();   // 容忍手滑加的引号
-                    if (k.length() > 0 && v.length() > 0) kv.put(k, v);
-                }
+                parseConf(br, kv);
             } catch (Exception ignored) {
             } finally {
                 try { if (br != null) br.close(); } catch (Exception ignored) {}
             }
-            return kv;
+            break;
         }
         return kv;
     }
 
-    /** 应用配置：台名 + 欢迎语。两者都缺就是「欢迎来到 <默认台名>，」。 */
+    /** 应用配置：台名 / 欢迎语 / 台词秒数，再读台词文件。台名与欢迎语都缺就是「欢迎来到 <默认台名>，」。 */
     private void loadConf() {
         HashMap<String, String> kv = readConf();
         String name = kv.get("app_name");
         if (name != null) appName = name;
         String welcome = kv.get("welcome");
         welcomeText = welcome != null ? welcome : ("欢迎来到 " + appName + "，");
-        Log.i(TAG, "配置: 台名=" + appName + "，欢迎语=" + welcomeText);
+
+        String secs = kv.get("opening_secs");
+        if (secs != null) {
+            try {
+                int n = Integer.parseInt(secs.trim());
+                if (n > 0 && n <= 300) openingSecs = n;      // 越界的值当没写
+            } catch (Exception ignored) {
+            }
+        }
+        String hold = kv.get("opening_hold");
+        if (hold != null) {
+            String v = hold.trim().toLowerCase();
+            openingHold = v.equals("1") || v.equals("on") || v.equals("true") || v.equals("yes");
+        }
+
+        /* 直播提醒：两个键都必须存在、都是严格 HH:mm、且结束晚于开始。
+           任一条件不满足就整个功能关闭，并立刻收起已经弹出的卡片。 */
+        liveEnabled = false;
+        liveStartMin = liveEndMin = -1;
+        liveStartTxt = liveEndTxt = "";
+        String ls = kv.get("live_start"), le = kv.get("live_end");
+        if (ls != null && le != null) {
+            int a = parseHhMm(ls), b = parseHhMm(le);
+            if (a >= 0 && b >= 0 && b > a) {
+                liveEnabled = true;
+                liveStartMin = a; liveEndMin = b;
+                liveStartTxt = ls.trim(); liveEndTxt = le.trim();
+            } else {
+                Log.w(TAG, "直播提醒未启用：live_start/live_end 须为 HH:mm 且结束晚于开始（"
+                        + ls + " / " + le + "）");
+            }
+        }
+        if (!liveEnabled) liveNotice = 0;
+        lastLiveMinute = -1;        // 配置变了，下一帧按新时间重新判断
+        loadOpenings();
+        loadSetlist();
+
+        Log.i(TAG, "配置: 台名=" + appName + "，欢迎语=" + welcomeText
+                + "，台词=" + openings.size() + " 条，今晚歌单=" + setlist.size() + " 首"
+                + "，直播=" + (liveEnabled ? liveStartTxt + "-" + liveEndTxt : "未启用"));
+    }
+
+    /** 严格 HH:mm：恰好 5 个字符、第 3 位是半角冒号、其余全是半角数字，
+        小时 00-23、分钟 00-59；全角字符、"18:5"、"25:00" 一律视为不合法。 */
+    private static int parseHhMm(String raw) {
+        if (raw == null) return -1;
+        String s = raw.trim();
+        if (s.length() != 5 || s.charAt(2) != ':') return -1;
+        for (int i = 0; i < 5; i++) {
+            if (i == 2) continue;
+            char ch = s.charAt(i);
+            if (ch < '0' || ch > '9') return -1;
+        }
+        int h = (s.charAt(0) - '0') * 10 + (s.charAt(1) - '0');
+        int m = (s.charAt(3) - '0') * 10 + (s.charAt(4) - '0');
+        if (h > 23 || m > 59) return -1;
+        return h * 60 + m;
+    }
+
+    /** 每分钟判一次：进入直播时段弹「开始」（开机晚了也补一次），
+        结束前 10 分钟弹「预告」；同一天同类提醒只弹一次，卡片留到换歌才收。 */
+    private void checkLiveNotice() {
+        if (!liveEnabled || prefs == null) return;
+        long minute = System.currentTimeMillis() / 60000L;
+        if (minute == lastLiveMinute) return;
+        lastLiveMinute = minute;
+        Calendar cal = Calendar.getInstance();
+        int now = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE);
+        String day = cal.get(Calendar.YEAR) + "-" + (cal.get(Calendar.MONTH) + 1)
+                + "-" + cal.get(Calendar.DAY_OF_MONTH);
+        int warnMin = liveEndMin - 10;
+        if (warnMin >= liveStartMin && now >= warnMin && now < liveEndMin
+                && !day.equals(prefs.getString("live_warn_day", ""))) {
+            liveNotice = 2;
+            liveNoticeLeft = liveEndMin - now;
+            /* 预告已代表本时段，顺手把「开始」也标成已弹：
+               否则下一分钟 else-if 会用「直播开始啦」把刚弹的预告覆盖掉。 */
+            SharedPreferences.Editor e = prefs.edit();
+            e.putString("live_warn_day", day);
+            e.putString("live_start_day", day);
+            e.commit();
+            Log.i(TAG, "直播提醒：距离 " + liveEndTxt + " 结束还有 "
+                    + liveNoticeLeft + " 分钟");
+        } else if (liveNotice == 0 && now >= liveStartMin && now < liveEndMin
+                && !day.equals(prefs.getString("live_start_day", ""))) {
+            liveNotice = 1;
+            prefs.edit().putString("live_start_day", day).commit();
+            Log.i(TAG, "直播提醒：直播开始 " + liveStartTxt + "-" + liveEndTxt
+                    + "（电视时间 " + String.format("%02d:%02d", now / 60, now % 60) + "）");
+        }
+    }
+
+    /** 台词文件的键：去掉扩展名、去首尾空白、统一小写。
+        歌名在磁盘上叫「02-故乡情 - 程琳」，键就是「02-故乡情 - 程琳」。 */
+    private static String openingKey(String name) {
+        if (name == null) return "";
+        String s = name.trim();
+        int dot = s.lastIndexOf('.');
+        if (dot > 0) s = s.substring(0, dot);
+        return s.trim().toLowerCase();
+    }
+
+    /** 容忍有人把序号去掉写进台词文件：再比一次「序号-」之后的纯歌名。 */
+    private static String openingLooseKey(String key) {
+        int i = 0, n = key.length();
+        while (i < n) {
+            char ch = key.charAt(i);
+            if (Character.isDigit(ch) || ch == '-' || ch == '_' || ch == ' ' || ch == '.') i++;
+            else break;
+        }
+        return i > 0 && i < n ? key.substring(i) : key;
+    }
+
+    /** 读 U 盘根目录的台词文件。格式：
+            ## 歌文件名（不带扩展名）
+            台词正文，可以写多行
+        「#」开头但不是「##」的行当注释。文件不存在就清空，一句台词都不显示。 */
+    private void loadOpenings() {
+        openings.clear();
+        for (String r : ROOTS) {
+            File f = new File(r, OPENINGS_FILE);
+            if (!f.isFile()) continue;
+            BufferedReader br = null;
+            try {
+                br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(f), "UTF-8"), 1024);
+                String line, key = null;
+                StringBuilder body = new StringBuilder();
+                while ((line = br.readLine()) != null) {
+                    if (line.length() > 0 && line.charAt(0) == '\uFEFF')
+                        line = line.substring(1);          // 记事本 UTF-8 BOM
+                    String t = line.trim();
+                    if (t.startsWith("##")) {
+                        putOpening(key, body);
+                        key = openingKey(t.substring(2));
+                        body.setLength(0);
+                    } else if (t.startsWith("#")) {
+                        continue;                          // 注释
+                    } else if (key != null) {
+                        if (t.length() > 0) {
+                            if (body.length() > 0) body.append('\n');
+                            body.append(t);
+                        }
+                    }
+                }
+                putOpening(key, body);
+            } catch (Exception ignored) {
+            } finally {
+                try { if (br != null) br.close(); } catch (Exception ignored) {}
+            }
+            break;
+        }
+    }
+
+    private void putOpening(String key, StringBuilder body) {
+        if (key == null || key.length() == 0 || body.length() == 0) return;
+        String text = body.toString();
+        openings.put(key, text);
+        String loose = openingLooseKey(key);
+        if (!loose.equals(key) && !openings.containsKey(loose)) openings.put(loose, text);
+    }
+
+    /** 这首歌的台词；没有就返回 null（不显示）。 */
+    private String openingFor(Song s) {
+        if (s == null || openings.isEmpty()) return null;
+        String k = openingKey(s.name);
+        String v = openings.get(k);
+        if (v == null) v = openings.get(openingLooseKey(k));
+        return v;
+    }
+
+    /** 读 U 盘根目录的今晚歌单：一行一首，顺序即演唱顺序，「#」开头是注释。
+        歌名写法与台词文件一致（带不带 02- 序号都认）。 */
+    private void loadSetlist() {
+        setlist.clear();
+        for (String r : ROOTS) {
+            File f = new File(r, SETLIST_FILE);
+            if (!f.isFile()) continue;
+            BufferedReader br = null;
+            try {
+                br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(f), "UTF-8"), 512);
+                String line;
+                int n = 0;
+                while ((line = br.readLine()) != null) {
+                    if (line.length() > 0 && line.charAt(0) == '\uFEFF')
+                        line = line.substring(1);
+                    String t = line.trim();
+                    if (t.length() == 0 || t.startsWith("#")) continue;
+                    String k = openingKey(t);
+                    if (k.length() == 0) continue;
+                    if (!setlist.containsKey(k)) setlist.put(k, n++);
+                }
+            } catch (Exception ignored) {
+            } finally {
+                try { if (br != null) br.close(); } catch (Exception ignored) {}
+            }
+            break;
+        }
+    }
+
+    /** 在今晚歌单里排第几；没列过返回 MAX_VALUE（照旧往后排）。 */
+    private int setlistRankOf(Song s) {
+        if (setlist.isEmpty() || s == null) return Integer.MAX_VALUE;
+        String k = openingKey(s.name);
+        Integer r = setlist.get(k);
+        if (r == null) r = setlist.get(openingLooseKey(k));
+        return r == null ? Integer.MAX_VALUE : r.intValue();
     }
 
     /** 后台扫曲库：文件遍历与 LRC 解析都放到工作线程，扫完回主线程一次性替换列表。
@@ -678,7 +972,9 @@ public class KaraokeActivity extends Activity {
 
     /** 主线程应用扫描结果：排序、替换、修正游标；首扫完成才关掉启动页并接着上次唱。 */
     private void applySongs(ArrayList<Song> fresh) {
-        Collections.sort(fresh, SONG_ORDER);   // 点歌次数降序 -> 文件名升序
+        Collections.sort(fresh, SONG_ORDER);   // 今晚歌单在前 -> 点歌次数降序 -> 文件名升序
+        setlistHits = 0;
+        for (Song s : fresh) if (setlistRankOf(s) != Integer.MAX_VALUE) setlistHits++;
         songs = fresh;
         if (cur >= songs.size()) cur = 0;
         if (listCursor >= songs.size()) listCursor = 0;
@@ -950,6 +1246,7 @@ public class KaraokeActivity extends Activity {
 
     private void play(final int idx, int startAt, boolean autoStart, boolean countPlay) {
         if (songs.isEmpty() || usbGone) return;
+        if (idx != cur) liveNotice = 0;   // 换一首歌才收起；重唱 / 切音轨 / seek 都不算
         stopPlayer();
         seekFloor = 0;
         rollLastLine = Integer.MIN_VALUE;   // 换歌 / 重唱 / 换音轨：歌词直接就位，不滚
@@ -1111,6 +1408,14 @@ public class KaraokeActivity extends Activity {
         if (usbGone) {
             if (key == KeyEvent.KEYCODE_MENU) { onUsbMounted(); return true; }
             if (key == KeyEvent.KEYCODE_BACK) { finish(); return true; }
+            return true;
+        }
+        /* # 键：台词显示 / 隐藏。歌单开着也认，免得为藏一张台词卡先退出歌单。 */
+        if (key == KeyEvent.KEYCODE_POUND) {
+            if (e.getRepeatCount() > 0) return true;      // 长按不来回抖
+            openingOn = !openingOn;
+            showBanner(openingOn ? "台词 开" : "台词 关");
+            Log.i(TAG, "台词显示 = " + openingOn);
             return true;
         }
         if (showList) return onListKey(key);
@@ -1515,7 +1820,10 @@ public class KaraokeActivity extends Activity {
             drawMarquee(c, W, H);
 
             if (showList) drawLibList(c, W, H, pad);
-            else drawLyricsArea(c, W, H, pad);
+            else {
+                drawLyricsArea(c, W, H, pad);
+                drawOpening(c, W, H, pad);       // 台词浮在歌词之上，不占歌词排版
+            }
 
             int dur = duration();
             float bw = W - 2 * pad, by = H * 0.775f, bh = Math.max(10, H * 0.011f);
@@ -1530,6 +1838,7 @@ public class KaraokeActivity extends Activity {
             }
 
             drawButtonBar(c, W, H, pad);
+            drawLiveNotice(c, W, H, pad);
             drawBanner(c, W, H);
         }
 
@@ -1576,9 +1885,13 @@ public class KaraokeActivity extends Activity {
             float flagW = pSub.measureText(flags);
             c.drawText(flags, rightX, H * 0.158f, pSub);
 
-            pSub.setColor(err.length() > 0 ? BAD : INK_DIM);
-            fit(pSub, hintText(), W * 0.42f, W * FS_SUB);
-            c.drawText(hintText(), rightX - flagW - W * 0.028f, H * 0.158f, pSub);
+            /* 提示为空（歌单展开）就整段不画，只留右侧状态，别占位置。 */
+            String hint = hintText();
+            if (hint.length() > 0) {
+                pSub.setColor(err.length() > 0 ? BAD : INK_DIM);
+                fit(pSub, hint, W * 0.42f, W * FS_SUB);
+                c.drawText(hint, rightX - flagW - W * 0.028f, H * 0.158f, pSub);
+            }
             pSub.setColor(INK_SOFT);
             pSub.setTextAlign(Paint.Align.LEFT);
         }
@@ -1684,7 +1997,9 @@ public class KaraokeActivity extends Activity {
 
         private String hintText() {
             if (err.length() > 0) return err;
-            if (showList) return "↑↓ 选歌    OK 马上唱    3 返回    0 切歌";
+            /* 歌单展开时顶栏不留提示：选歌 / 马上唱已并入列表头那一行，
+               再在这里写一遍就成了两行字挤在一起。 */
+            if (showList) return "";
             return "OK 播放 / 暂停";
         }
 
@@ -1931,18 +2246,27 @@ public class KaraokeActivity extends Activity {
         /* ---------- 内容区 B：歌单（U 盘目录即已点歌单，三态） ---------- */
 
         private void drawLibList(Canvas c, int W, int H, float pad) {
-            float x = pad, w = W - 2 * pad, y0 = H * 0.215f, rh = H * 0.088f;
+            float x = pad, w = W - 2 * pad, y0 = H * 0.222f, rh = H * 0.088f;
             syncLibTop();
+            /* 头部只留一行：左边排序说明，右边操作提示 + 剩余数量。
+               操作键（3 收起 / 0 切歌）不再写字——四个大按钮的角标已经印着，
+               顶栏第二行也不再重复一遍，避免两行提示挤在一起。 */
             pSub.setTextSize(W * FS_SUB);
             pSub.setTextAlign(Paint.Align.LEFT);
-            c.drawText("全部 " + songs.size() + " 首  ·  按点歌次数排序",
-                       x, H * 0.198f, pSub);
+            pSub.setColor(INK_SOFT);
+            String head = setlistHits > 0
+                    ? "今晚歌单 " + setlistHits + " 首在前　·　其余按点歌次数"
+                    : "按歌名 / 点歌次数排序";
+            fit(pSub, head, w * 0.42f, W * FS_SUB);
+            c.drawText(head, x, H * 0.198f, pSub);
+
+            String ops = "↑↓ 选歌　　OK 马上唱";
             int rest = songs.size() - libTop - 6;
-            if (rest > 0) {
-                pSub.setTextAlign(Paint.Align.RIGHT);
-                c.drawText("下面还有 " + rest + " 首，继续按 ↓", x + w, H * 0.198f, pSub);
-                pSub.setTextAlign(Paint.Align.LEFT);
-            }
+            if (rest > 0) ops += "　　·　　还有 " + rest + " 首 ↓";
+            pSub.setTextAlign(Paint.Align.RIGHT);
+            fit(pSub, ops, w * 0.58f, W * FS_SUB);   // 剩余数到三位也不溢出
+            c.drawText(ops, x + w, H * 0.198f, pSub);
+            pSub.setTextAlign(Paint.Align.LEFT);
 
             pCur.setTextAlign(Paint.Align.LEFT);
             for (int k = 0; k < 6; k++) {
@@ -1971,7 +2295,10 @@ public class KaraokeActivity extends Activity {
                            x + W * 0.075f, y + h * 0.66f, pCur);
 
                 // 三态标签 + 点歌次数（能直接看到「记下来了」）
-                String tag = now ? "▶ 正在唱" : (sung ? "已唱过" : "");
+                int rank = setlistRankOf(songs.get(idx));
+                String tag = now ? "▶ 正在唱"
+                           : (sung ? "已唱过"
+                           : (rank != Integer.MAX_VALUE ? "第 " + (rank + 1) + " 首" : ""));
                 int pc = songs.get(idx).plays;
                 if (pc > 0) tag = tag.length() > 0 ? (tag + "  " + pc + " 次") : (pc + " 次");
                 if (tag.length() > 0) {
@@ -1988,6 +2315,40 @@ public class KaraokeActivity extends Activity {
         }
 
         /* ---------- 大字反馈 / 预告 / 过场 / 拔盘 / 空库 ---------- */
+
+        /** 直播提醒：屏幕右侧中部。左侧是台词卡、中间留给歌词，两边互不遮挡。
+            金边带轻微呼吸，主字按卡片宽度自适应缩放；只有换歌才会消失。 */
+        private void drawLiveNotice(Canvas c, int W, int H, float pad) {
+            if (liveNotice == 0 || !liveEnabled) return;
+            boolean warn = liveNotice == 2;
+            float bw = W * 0.255f, bh = H * 0.170f;
+            float bx = W - pad - bw, by = H * 0.455f - bh / 2f;
+            float g = W * 0.016f;
+
+            card(c, pLiveBg, bx, by, bw, bh, W);
+            float pulse = 0.78f + 0.22f * (float) Math.sin(System.currentTimeMillis() / 520.0);
+            pLiveEdge.setStrokeWidth(Math.max(3f, W * 0.0035f));
+            pLiveEdge.setColor(Color.argb((int) (255 * pulse), 255, 201, 74));
+            card(c, pLiveEdge, bx, by, bw, bh, W);
+            card(c, pGold, bx + g * 0.8f, by + g, W * 0.006f, bh - g * 2f, W);
+
+            float tagFs = W * 0.0155f, mainFs = W * 0.029f,
+                  subFs = W * 0.018f, footFs = W * 0.0125f;
+            float tx = bx + g * 2.2f;
+            String tag = warn ? "结束预告" : "直播提醒";
+            String main = warn ? ("还有 " + liveNoticeLeft + " 分钟") : "直播开始啦";
+            String sub = warn ? (liveEndTxt + " 直播结束")
+                             : (liveStartTxt + " - " + liveEndTxt);
+
+            pLiveTag.setTextSize(tagFs);
+            c.drawText(tag, tx, by + g + tagFs, pLiveTag);
+            fitExact(pLiveMain, main, bw - g * 3f, mainFs);
+            c.drawText(main, tx, by + bh * 0.53f, pLiveMain);
+            pLiveSub.setTextSize(subFs);
+            c.drawText(sub, tx, by + bh * 0.76f, pLiveSub);
+            pLiveFoot.setTextSize(footFs);
+            c.drawText("换首歌自动收起", tx, by + bh - g * 0.55f, pLiveFoot);
+        }
 
         private void drawBanner(Canvas c, int W, int H) {
             if (!bannerActive()) return;
@@ -2041,6 +2402,115 @@ public class KaraokeActivity extends Activity {
             centerAt(c, pNext, "U 盘里放 歌名.mp3 + 歌名.lrc [+ 歌名.伴奏.mp3]",
                      cx, H * 0.52f, W * 0.024f, INK_SOFT);
             centerAt(c, pNext, "插好后按 菜单 重新扫描", cx, H * 0.59f, W * 0.024f, INK_SOFT);
+        }
+
+        /* ---------- 开场台词：浮在歌词左侧的半透明白卡 ---------- */
+
+        /** 台词停到第几毫秒：最多 opening_secs（默认 30 秒）；这首歌前奏短就提前收，
+            不让卡片一直盖在已经开唱的歌词上，但至少留 6 秒够念两句。
+            opening_hold=1 时不提前收，一直显示到秒数用完（整段开场词要念完时用）。 */
+        private int openingUntilMs() {
+            int ms = openingSecs * 1000;
+            if (openingHold) return ms;
+            if (cur >= 0 && cur < songs.size()) {
+                Song s = songs.get(cur);
+                if (s.hasLrc && !s.lines.isEmpty()) {
+                    long first = firstRealMs(s);
+                    if (first > 0 && first + 2000 < ms)
+                        ms = (int) Math.max(6000L, first + 2000);
+                }
+            }
+            return ms;
+        }
+
+        private void drawOpening(Canvas c, int W, int H, float pad) {
+            if (!openingOn || songs.isEmpty() || showList || usbGone) return;
+            if (cur < 0 || cur >= songs.size()) return;
+            if (System.currentTimeMillis() < interludeUntil) return;   // 过场页不叠
+            String text = openingFor(songs.get(cur));
+            if (text == null || text.length() == 0) return;            // 这首没台词
+            int pos = position(), until = openingUntilMs();
+            if (pos < 0 || pos >= until) return;
+
+            float a = 1f;                                 // 头 350ms 淡入、尾 700ms 淡出
+            if (pos < 350) a = pos / 350f;
+            else if (pos > until - 700) a = (until - pos) / 700f;
+            if (a <= 0.02f) return;
+            int alpha = (int) (255 * Math.min(1f, a));
+
+            float bw = W * 0.300f, bp = W * 0.016f;
+            float titleFs = W * 0.0155f;
+            float fsMax = W * 0.0185f, fsMin = W * 0.0130f, fs = fsMax;
+            float maxH = H * 0.735f - H * 0.180f;      // 顶栏下沿到进度条上沿
+            ArrayList<String> rows;
+            float lh, bh;
+            /* 词多的段落（比如整段开场词）按可用高度逐级缩字号，缩到底还放不下就截断。 */
+            while (true) {
+                lh = fs * 1.62f;
+                pOpenText.setTextSize(fs);
+                rows = openingRows(pOpenText, text, bw - bp * 2);
+                bh = bp + titleFs * 1.6f + rows.size() * lh + bp * 0.7f;
+                if (bh <= maxH || fs <= fsMin) break;
+                fs = Math.max(fsMin, fs * 0.92f);
+            }
+            int cap = (int) ((maxH - bp - titleFs * 1.6f - bp * 0.7f) / lh);
+            if (cap >= 1 && rows.size() > cap) {
+                rows = new ArrayList<String>(rows.subList(0, cap));
+                int last = rows.size() - 1;
+                rows.set(last, rows.get(last) + "…");
+                bh = bp + titleFs * 1.6f + rows.size() * lh + bp * 0.7f;
+            }
+            float bx = pad, by = H * 0.455f - bh / 2f;
+            if (by < H * 0.180f) by = H * 0.180f;              // 别顶到顶栏
+            if (by + bh > H * 0.735f) by = H * 0.735f - bh;    // 别压住进度条
+
+            pOpenBg.setColor((alpha << 24) | 0xFFFFFF);
+            card(c, pOpenBg, bx, by, bw, bh, W);
+
+            pOpenTitle.setTextSize(titleFs);
+            pOpenTitle.setTextAlign(Paint.Align.LEFT);
+            pOpenTitle.setColor((alpha << 24) | 0xA06A00);
+            c.drawText("开场词", bx + bp, by + bp + titleFs, pOpenTitle);
+            pOpenTitle.setTextAlign(Paint.Align.RIGHT);
+            pOpenTitle.setColor((alpha << 24) | 0x7C8AA0);
+            c.drawText("按 # 收起", bx + bw - bp, by + bp + titleFs, pOpenTitle);
+            pOpenTitle.setTextAlign(Paint.Align.LEFT);
+
+            pOpenText.setColor((alpha << 24) | 0x152238);
+            float ty = by + bp + titleFs * 1.6f;
+            for (int i = 0; i < rows.size(); i++)
+                c.drawText(rows.get(i), bx + bp, ty + i * lh + fs, pOpenText);
+        }
+
+        /** 按像素宽度折行：先认 \n 分段，再逐字累加；并做最简避头尾，
+            不让逗号句号跑到行首、开引号落在行尾。缓存按「文本 + 宽度」失效，
+            换歌只重新折一次，老机器上不白烧 CPU。 */
+        private ArrayList<String> openingRows(Paint p, String text, float maxW) {
+            float fs = p.getTextSize();
+            if (openRows != null && maxW == openRowsW && fs == openRowsFs && text.equals(openRowsFor))
+                return openRows;
+            ArrayList<String> out = new ArrayList<String>();
+            for (String para : text.split("\n")) {
+                int start = 0, n = para.length();
+                if (n == 0) { out.add(""); continue; }
+                while (start < n) {
+                    int end = start + 1;
+                    while (end <= n && p.measureText(para.substring(start, end)) <= maxW) end++;
+                    end--;                          // 退回最后一个放得下的字
+                    if (end <= start) end = start + 1;
+                    while (end < n && NO_LINE_START.indexOf(para.charAt(end)) >= 0
+                           && end - start < n) end++;          // 标点跟着上一行走
+                    if (end - start > 1 && NO_LINE_END.indexOf(para.charAt(end - 1)) >= 0)
+                        end--;                                  // 开引号不留在行尾
+                    out.add(para.substring(start, end));
+                    start = end;
+                }
+            }
+            openRowsFor = text;
+            openRowsW = maxW;
+            openRowsFs = fs;
+            openRows = out;
+            return out;
         }
 
         /* ---------- 启动过渡页 ---------- */
